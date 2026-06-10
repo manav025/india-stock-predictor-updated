@@ -111,76 +111,129 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
     """Make the DatetimeIndex timezone-naive and date-only."""
     if df.index.tz is not None:
-        df.index = df.index.tz_convert(None)   # safe even if already naive
+        df.index = df.index.tz_convert(None)
     df.index = df.index.normalize()
     return df
 
-def _yf_download_with_retry(tickers: list, period: str, max_retries: int = 3) -> pd.DataFrame:
+# Browser headers — makes the request look like Chrome, not a Python script
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def _fetch_yahoo_direct(ticker: str, period: str) -> pd.DataFrame:
     """
-    Single batched yf.download() call with exponential backoff.
-    One HTTP request for N tickers beats N separate requests every time —
-    far less likely to trigger Yahoo Finance rate limits.
+    Hits Yahoo Finance's raw chart API directly with browser headers.
+    Bypasses yfinance library — works even when yf.download() is blocked
+    on shared cloud IPs (Streamlit Cloud, Heroku, etc.)
     """
-    for attempt in range(max_retries):
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?range={period}&interval=1d&includePrePost=false"
+    )
+    for attempt in range(3):
         try:
-            raw = yf.download(
-                tickers,
-                period=period,
-                auto_adjust=True,
-                progress=False,
-                threads=False,      # sequential inside yfinance — safer on shared IPs
-            )
-            if not raw.empty:
-                return raw
+            res = requests.get(url, headers=_HEADERS, timeout=15)
+            if res.status_code == 429:          # rate limited — wait and retry
+                time.sleep(2 ** attempt)
+                continue
+            if res.status_code != 200:
+                return pd.DataFrame()
+
+            result = res.json()["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            quote      = result["indicators"]["quote"][0]
+
+            df = pd.DataFrame({
+                "open":   quote["open"],
+                "high":   quote["high"],
+                "low":    quote["low"],
+                "close":  quote["close"],
+                "volume": quote["volume"],
+            }, index=pd.to_datetime(timestamps, unit="s"))
+
+            return _normalize_index(df.dropna())
+
         except Exception:
-            pass
-        if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)   # 1 s → 2 s → 4 s
+            if attempt < 2:
+                time.sleep(2 ** attempt)
     return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600)
 def fetch_stock_data(ticker: str, period: str):
-    raw = _yf_download_with_retry([ticker], period)
-    if raw.empty:
-        return None
-    # Single-ticker download: columns are flat (Open, High, …)
-    # Multi-ticker download: columns are MultiIndex — unwrap if needed
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw = raw.xs(ticker, axis=1, level=1)
-    df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    df.columns = ['open', 'high', 'low', 'close', 'volume']
-    return _normalize_index(df)
+    # Try direct API first (faster, bypasses rate limits)
+    df = _fetch_yahoo_direct(ticker, period)
+    if df is not None and not df.empty:
+        return df
+
+    # Fallback: yfinance with retry
+    for attempt in range(3):
+        try:
+            raw = yf.download(
+                [ticker], period=period,
+                auto_adjust=True, progress=False, threads=False
+            )
+            if not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw = raw.xs(ticker, axis=1, level=1)
+                df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                df.columns = ['open', 'high', 'low', 'close', 'volume']
+                return _normalize_index(df)
+        except Exception:
+            pass
+        time.sleep(2 ** attempt)
+    return None
 
 
 @st.cache_data(ttl=3600)
 def fetch_macro_data(period: str):
     """
-    Downloads VIX, Crude Oil, and USD/INR in ONE batched request.
-    Falls back gracefully if any single series is missing.
+    Fetches VIX, Oil, USD/INR using direct Yahoo API (browser headers).
+    Falls back to yf.download() if direct call fails.
     """
     MACRO_MAP = {
         "^INDIAVIX": "vix",
         "CL=F":      "oil",
         "INR=X":     "usd_inr",
     }
-    raw = _yf_download_with_retry(list(MACRO_MAP.keys()), period)
-    if raw.empty:
-        st.error("❌ Macro data unavailable after retries. Check your connection.")
-        return None
-
-    # yf.download with multiple tickers returns MultiIndex columns: (field, ticker)
-    close = raw["Close"] if "Close" in raw.columns else raw["Adj Close"]
-
     series = {}
     for yf_ticker, col_name in MACRO_MAP.items():
-        if yf_ticker in close.columns:
-            series[col_name] = close[yf_ticker]
-        else:
-            st.warning(f"⚠️ {col_name.upper()} ({yf_ticker}) missing from batch — skipping.")
+        df = _fetch_yahoo_direct(yf_ticker, period)
+        if df is not None and not df.empty:
+            series[col_name] = df["close"]
+
+    # If direct API got everything — done
+    if len(series) == len(MACRO_MAP):
+        macro = pd.DataFrame(series).ffill().dropna()
+        return _normalize_index(macro)
+
+    # Fallback: yfinance batch download for any missing series
+    missing = [t for t, c in MACRO_MAP.items() if c not in series]
+    for attempt in range(3):
+        try:
+            raw = yf.download(
+                missing, period=period,
+                auto_adjust=True, progress=False, threads=False
+            )
+            if not raw.empty:
+                close = raw["Close"] if "Close" in raw.columns else raw["Adj Close"]
+                for yf_t, col in MACRO_MAP.items():
+                    if col not in series and yf_t in close.columns:
+                        series[col] = close[yf_t]
+                break
+        except Exception:
+            pass
+        time.sleep(2 ** attempt)
 
     if len(series) < len(MACRO_MAP):
-        st.error("❌ One or more macro series unavailable. Cannot build full feature set.")
+        missing_cols = [c for c in MACRO_MAP.values() if c not in series]
+        st.error(f"❌ Macro data unavailable: {missing_cols}. Try refreshing in a minute.")
         return None
 
     macro = pd.DataFrame(series).ffill().dropna()
