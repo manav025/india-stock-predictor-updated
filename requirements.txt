@@ -9,5 +9,3 @@ requests
 plotly
 textblob
 newsapi-python
-transformers
-scikit-learn
